@@ -1,0 +1,23 @@
+# Build output
+build/
+.gradle/
+.kotlin/
+out/
+
+# Android
+local.properties
+*.apk
+*.aab
+
+# CMake / Visual Studio
+.vs/
+*.user
+CMakeCache.txt
+CMakeFiles/
+
+# Windows
+Thumbs.db
+desktop.ini
+
+# Claude
+.claude/settings.local.json
