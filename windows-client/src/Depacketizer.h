@@ -17,6 +17,8 @@ public:
     using OnAccessUnit = std::function<void(const uint8_t* data, size_t size, uint32_t ts, bool key)>;
 
     void setCallback(OnAccessUnit cb) { cb_ = std::move(cb); }
+    /** HEVC uses RFC 7798: two-byte NAL headers and different aggregation types. */
+    void setHevc(bool hevc) { hevc_ = hevc; }
     void push(const uint8_t* pkt, int len);
     void reset();
 
@@ -33,6 +35,7 @@ public:
 
 private:
     void startNal(const uint8_t* payload, int len);
+    void pushHevc(const uint8_t* payload, int len, bool marker, uint32_t ts);
     void emit(uint32_t ts);
 
     OnAccessUnit cb_;
@@ -43,6 +46,7 @@ private:
     bool sawIdr_ = false;
     bool needIdr_ = true;
     bool inFragment_ = false;
+    bool hevc_ = false;
 };
 
 } // namespace awc

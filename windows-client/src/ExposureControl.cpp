@@ -8,6 +8,10 @@ namespace awc {
 namespace {
 constexpr int64_t kMainsPeriodNs = 10'000'000;    // 50 Hz
 constexpr int64_t kFlickerFreeMin = kMainsPeriodNs;
+
+// The whole point of this mode is a short exposure, so the ladder stops at two mains
+// periods even if that leaves the picture dark: 33 ms would bring the blur straight back.
+constexpr int64_t kMaxExposureNs = 20'000'000;
 } // namespace
 
 void ExposureControl::setLimits(int isoMin, int isoMax, int64_t exposureMinNs,
@@ -30,7 +34,7 @@ void ExposureControl::reset() {
 void ExposureControl::clamp() {
     if (exposureMaxNs_ > 0) {
         exposureNs_ = (std::max)(exposureMinNs_, (std::min)(exposureMaxNs_, exposureNs_));
-        exposureNs_ = (std::min)(exposureNs_, int64_t(33'000'000));   // keep 30 fps
+        exposureNs_ = (std::min)(exposureNs_, kMaxExposureNs);
     }
     if (isoMax_ > 0) iso_ = (std::max)(isoMin_, (std::min)(isoMax_, iso_));
 }
@@ -54,7 +58,7 @@ void ExposureControl::update(float meanLuma) {
     // Only when gain has nothing left to give does the exposure move, and it moves in
     // whole mains periods so the picture stays free of banding.
     if (iso_ >= isoMax_ && error > 1.07f) {
-        exposureNs_ = (std::min)(int64_t(33'000'000), exposureNs_ + kMainsPeriodNs);
+        exposureNs_ = (std::min)(kMaxExposureNs, exposureNs_ + kMainsPeriodNs);
     } else if (iso_ <= isoMin_ && error < 0.93f) {
         exposureNs_ = exposureNs_ > kFlickerFreeMin ? exposureNs_ - kMainsPeriodNs
                                                    : exposureNs_ / 2;

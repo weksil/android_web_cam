@@ -111,6 +111,36 @@ HKLM. `uninstall.ps1` reverts it.
 Flags: `--ip <address>` skips discovery, `--port` picks another RTP port, `--remove` unregisters,
 `--test` is a console diagnostic mode.
 
+### All controls live on the PC
+
+The tray menu owns capture: **Camera**, **Resolution**, **Frame rate**, **Bitrate**, **Codec**, plus
+the processing toggles. The phone app is a status display with a Start button; it holds no settings
+of its own.
+
+The phone reports what it can do (cameras with their labels and 16:9 sizes, and the frame rates the
+sensor advertises) in a `CAPABILITIES` message repeated with the rest of the telemetry, so the menus
+list what actually exists rather than a hardcoded guess. Picks go back as `SET_CONFIG`. After
+sending one, the PC deliberately drops the link: the reconnect brings a fresh `HELLO_ACK`, and the
+decoder is then built from what the phone really applied instead of what we asked for.
+
+Frame rates on offer come from `CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES` — on this device
+12/15/24/30 (see "Frame rate is capped by the sensor"). Choices are remembered in
+`HKCU\Software\AndroidWebCam`.
+
+### The phone screen turns itself off
+
+While streaming, the phone blanks after 15 seconds: window brightness to 0, black UI, and the
+preview stream is dropped from the repeating request so the camera stops producing buffers nobody
+looks at. Touching the screen brings it back for another 15 seconds. Verified through the system:
+the window reports `sbrt=0.0` and the display manager `screenBrightnessOverride=0.0`.
+
+The preview is toggled by re-issuing the repeating request without that target — the session is not
+reconfigured, so there is no hiccup in the stream.
+
+Note what this is not: the display is driven to zero, not switched off, because capture is tied to a
+foreground activity. A genuinely off screen with the stream alive needs a foreground camera service,
+which is a larger change. On AMOLED, a black frame at zero brightness costs almost nothing anyway.
+
 ### Gyro stabilization
 
 Toggled by **Gyro stabilization** in the tray menu (which also shows the current correction in
@@ -149,6 +179,85 @@ correction is zero and introduces no artifacts.
 a 33 ms frame and any motion smears within the frame. Stabilization cannot help here by
 construction — it fixes geometry, not blur. Use "Short exposure" for that.
 
+### Codec: H.264 or HEVC
+
+Picked by the codec spinner in the phone app (`--ei codec 1` selects HEVC when starting from
+adb). The phone uses `c2.qti.hevc.encoder`, the PC decodes with whatever HEVC MFT is installed —
+check yours with `awc-client.exe --decoders`.
+
+HEVC needs its own RTP payload format (RFC 7798, not 6184): NAL headers are two bytes, the
+fragmentation type is 49 and aggregation 48, and the parameter sets arrive as VPS+SPS+PPS packed
+into a single `csd-0` rather than split across `csd-0`/`csd-1`. IRAP pictures are NAL types 16–21,
+where H.264 has a single type 5.
+
+Where it helps: at a bitrate that is already generous, both codecs look the same and HEVC only
+costs the phone more heat. It pays off where bits are scarce. Measured on the same scene at 1080p30:
+
+| Bitrate | H.264 detail | HEVC detail |
+|---|---|---|
+| 8 Mbps | 2.4 | 2.3 (no difference — both transparent here) |
+| 2 Mbps | 1.9 | **2.4** |
+
+("detail" is the mean-gradient metric `--analyze` prints; the clips are seconds apart on a static
+scene, so treat it as indicative, not a codec benchmark.)
+
+### 120 and 240 fps
+
+Offered per resolution, because that is how the hardware offers them: on this device 120 fps
+exists up to 1080p and 240 fps only at 720p and below, while the ultra-wide and macro sensors have
+no high-speed modes at all. The **Resolution** menu shows each entry's ceiling, and the
+**Frame rate** menu lists only what the selected resolution can hold. The phone additionally checks
+that an encoder can take that size at that rate before offering it.
+
+Above 30 fps the phone switches to a constrained high-speed session, which is a different API
+(`createHighSpeedRequestList` + `setRepeatingBurst`) and refuses manual sensor control, so the
+short-exposure controller stands down — at 120 fps the exposure is at most 8 ms anyway, which was
+the point of that mode.
+
+The PC does not throw the extra frames away: it **averages** them down to ~30 fps out (4 frames at
+120, 8 at 240). Averaging four 8 ms exposures gives back the light a short exposure gave up and
+halves the noise, and because stabilized frames are warped onto a common orientation before
+stacking, camera shake does not smear the result.
+
+**The preview surface must be left out of a high-speed session.** With both the encoder and the
+preview attached, this HAL splits the frame batch between the two outputs and hands the encoder an
+empty buffer for every second frame. It arrives as a perfectly black frame, and once averaged with
+the good ones the picture comes out dark and green (chroma 64 instead of the neutral 128 — the
+mixed-in zeros pull it there). The same alternating pattern showed up decoding the raw dump with
+ffmpeg, which is what ruled out our own decoder. Above 30 fps the session therefore carries the
+encoder surface alone, and the phone shows no preview in those modes.
+
+Two more things this cost, both measured:
+
+- **Receive and decode had to be separated.** Decoding used to run inside the socket-draining loop.
+  At 30 fps there was slack; at 120 there was none, and the socket overflowed — 2286 packets lost in
+  eight seconds, even with stabilization off, so it was not the warp. Assembled frames are now
+  queued during the drain and decoded after it. Same test afterwards: **0 lost, 0 dropped**.
+- **Bitrate has to be sane.** 720p240 at 40 Mbps made the encoder burst to 78 Mbps and drowned the
+  link (8193 packets lost). At 12 Mbps the same mode runs clean.
+
+In practice the phone delivers ~95–120 fps rather than a solid 120 once it is warm; 240 fps is
+selectable and runs, but expect the sensor and encoder to fall short of the nominal rate.
+
+**These modes cost latency, inherently.** An output frame cannot leave before its whole group has
+arrived (33 ms at 120 fps), every frame is warped individually so the CPU does four times the work
+per output frame, and the link carries four times the packets. The frame-ready wait is now scaled to
+the frame rate rather than a fixed 250 ms, which removes the worst spikes, but the group delay
+remains. If latency matters more than blur and noise, stay at 30 fps.
+
+### Frame rate is capped by the sensor, not the codec
+
+Worth knowing before planning anything around 60 fps: on this device
+`getOutputMinFrameDuration` is **33333 µs at every size** — 1080p, 1440p, 720p alike — so a regular
+capture session cannot exceed 30 fps no matter what is requested, and `CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES`
+offers nothing above `[30,30]`. Both hardware encoders happily do 1080p60 and 1080p120; the camera
+is the limit.
+
+Above 30 fps there is only `createConstrainedHighSpeedCaptureSession`, and it offers **120 and 240
+fps only** — no 60. That session also restricts 3A: manual exposure and EIS are off the table, so it
+would replace the short-exposure controller rather than complement it (at 120 fps the exposure is
+implicitly ≤8.3 ms anyway).
+
 ### Horizon leveling
 
 The **Level horizon** checkbox in the tray menu (its label shows the current tilt).
@@ -178,6 +287,11 @@ Two subtleties, both important:
 Checking it without a phone: `awc-client.exe --leveltest` builds the frame a camera tilted by 5°
 would see, feeds the matching gravity vector and measures the result.
 
+Metering on the detected face was tried and removed: exposing for a small, moving region made the
+brightness lag visibly behind the scene, and it fought the exposure cap (a face in a dim room asks
+for more light than ISO 2000 can give at a short exposure, so the controller kept walking the
+exposure up — undoing the mode). Metering is whole-frame.
+
 ### Short exposure
 
 The **Short exposure** checkbox in the tray menu (its label shows the current exposure and ISO).
@@ -197,6 +311,12 @@ usually not an issue.
 
 **On 60 Hz mains** the period is 8.33 ms — change `kMainsPeriodNs` in
 [ExposureControl.cpp](windows-client/src/ExposureControl.cpp) or you will get banding.
+
+The ladder stops at **20 ms** even if the picture stays dark: 33 ms would bring the blur straight
+back, which is the whole point of the mode. This bites together with face metering — exposing for a
+face in a dim room needed more light than ISO 2000 could supply at 10 ms, so the controller walked
+up to the 20 ms cap and parked at maximum gain. Prefer a brighter picture over a sharp one? Raise
+`kMaxExposureNs`.
 
 The price is noise: in a dark room ISO climbs past a thousand. With enough light the mode is
 pointless — auto exposure picks a short exposure on its own.

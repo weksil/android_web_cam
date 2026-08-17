@@ -23,6 +23,7 @@ struct StreamParams {
     uint32_t bitrate = 0;
     uint32_t ssrc = 0;
     uint16_t rtpSourcePort = 0;
+    bool hevc = false;
 };
 
 /**
@@ -52,6 +53,9 @@ public:
     void setDeviceStabilization(bool onDevice);
     /** Fixed exposure with the gain we choose; exposureNs 0 restores auto exposure. */
     void setExposure(int64_t exposureNs, int32_t iso);
+    /** The PC owns camera, resolution, frame rate, bitrate and codec. */
+    void setConfig(const std::string& cameraId, uint16_t width, uint16_t height, uint8_t fps,
+                   uint32_t bitrate, bool hevc);
 
     const StreamParams& params() const { return params_; }
     const std::string& peer() const { return peerIp_; }

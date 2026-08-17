@@ -26,7 +26,8 @@ import java.nio.ByteOrder
  * the PC sends when an application actually opens the virtual camera.
  *
  * phone -> PC:
- *   0x02 HELLO_ACK     u16 w, u16 h, u8 fps, u32 bitrate, u32 ssrc, u16 rtpSourcePort
+ *   0x02 HELLO_ACK     u16 w, u16 h, u8 fps, u32 bitrate, u32 ssrc, u16 rtpSourcePort,
+ *                      u8 codec (0 = H.264, 1 = HEVC)
  *   0x11 FOUND         u16 controlPort, u8 nameLen, name (UTF-8)
  *
  * Video: RTP/UDP, payload type 96, 90 kHz clock, RFC 6184 (single NAL + FU-A).
@@ -54,6 +55,8 @@ object Control {
     const val STREAM_STOP = 0x08
     const val SET_EIS = 0x09     // u8: 1 = phone stabilizes, 0 = PC stabilizes from gyro
     const val SET_EXPOSURE = 0x0A // i64 exposureNs, i32 iso; exposureNs 0 = back to auto
+    // u8 idLen, id, u16 w, u16 h, u8 fps, u32 bitrate, u8 codec: the PC owns the settings
+    const val SET_CONFIG = 0x0B
     const val DISCOVER = 0x10
     const val FOUND = 0x11
     const val PUNCH = 0x12
@@ -64,6 +67,9 @@ object Control {
     const val FRAME_META = 0x22  // u32 rtpTs, i64 sensorNs, i64 exposureNs, i64 skewNs
     const val SENSOR_LIMITS = 0x23 // i32 isoMin, isoMax, i64 exposureMinNs, exposureMaxNs
     const val GRAVITY = 0x24     // f32 gx, gy, gz in device axes, m/s^2
+    // u8 cameraCount, per camera { u8 idLen, id, u8 labelLen, label, u8 sizes, per size u16 w,h },
+    // then u8 fpsCount, fps values: everything the PC needs to offer a choice.
+    const val CAPABILITIES = 0x26
 
     fun isValid(data: ByteArray, len: Int): Boolean =
         len >= 5 && data[0] == MAGIC[0] && data[1] == MAGIC[1] &&
@@ -81,7 +87,8 @@ data class StreamInfo(
     val fps: Int,
     val bitrate: Int,
     val ssrc: Int,
-    val rtpSourcePort: Int
+    val rtpSourcePort: Int,
+    val hevc: Boolean
 )
 
 /**
@@ -98,6 +105,7 @@ class ControlServer(
     private val onBitrate: (Int) -> Unit,
     private val onEis: (Boolean) -> Unit,
     private val onExposure: (Long, Int) -> Unit,
+    private val onConfig: (String, Int, Int, Int, Int, Boolean) -> Unit,
     private val onPeer: (String?) -> Unit
 ) {
     private var socket: DatagramSocket? = null
@@ -174,13 +182,14 @@ class ControlServer(
                 val info = onLink(p.address, rtpPort)
                 if (info == null) { dropPeer(); return }
                 onPeer("${p.address.hostAddress}:$rtpPort")
-                val out = Control.buffer(Control.HELLO_ACK, 15)
+                val out = Control.buffer(Control.HELLO_ACK, 16)
                     .putShort(info.width.toShort())
                     .putShort(info.height.toShort())
                     .put(info.fps.toByte())
                     .putInt(info.bitrate)
                     .putInt(info.ssrc)
                     .putShort(info.rtpSourcePort.toShort())
+                    .put(if (info.hevc) 1.toByte() else 0.toByte())
                 send(s, out.array(), p.address, p.port)
             }
 
@@ -190,6 +199,19 @@ class ControlServer(
             Control.SET_EIS -> if (p.address == peer && body.remaining() >= 1) onEis(body.get() != 0.toByte())
             Control.SET_EXPOSURE -> if (p.address == peer && body.remaining() >= 12)
                 onExposure(body.long, body.int)
+
+            Control.SET_CONFIG -> if (p.address == peer && body.remaining() >= 11) {
+                val idLength = body.get().toInt() and 0xFF
+                if (body.remaining() >= idLength + 10) {
+                    val id = ByteArray(idLength).also { body.get(it) }.toString(Charsets.UTF_8)
+                    val width = body.short.toInt() and 0xFFFF
+                    val height = body.short.toInt() and 0xFFFF
+                    val fps = body.get().toInt() and 0xFF
+                    val bitrate = body.int
+                    val hevc = body.get() != 0.toByte()
+                    onConfig(id, width, height, fps, bitrate, hevc)
+                }
+            }
             Control.STREAM_START -> if (p.address == peer) { lastSeen = System.currentTimeMillis(); onStreamStart() }
             Control.STREAM_STOP -> if (p.address == peer) { lastSeen = System.currentTimeMillis(); onStreamStop() }
             Control.BYE -> if (p.address == peer) dropPeer()

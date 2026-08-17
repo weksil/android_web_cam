@@ -39,6 +39,47 @@ void Depacketizer::emit(uint32_t ts) {
     inFragment_ = false;
 }
 
+/** RFC 7798: payload header is two bytes, type 49 is a fragment, 48 an aggregate. */
+void Depacketizer::pushHevc(const uint8_t* p, int n, bool marker, uint32_t ts) {
+    if (n < 2) { corrupt_ = true; return; }
+    const int type = (p[0] >> 1) & 0x3F;
+
+    if (type == 49) {                       // fragmentation unit
+        if (n < 3) { corrupt_ = true; return; }
+        const uint8_t fu = p[2];
+        const bool start = (fu & 0x80) != 0;
+        const bool end = (fu & 0x40) != 0;
+        const int nalType = fu & 0x3F;
+        if (start) {
+            au_.insert(au_.end(), kStartCode, kStartCode + 4);
+            au_.push_back(uint8_t((nalType << 1) | (p[0] & 0x01)));
+            au_.push_back(p[1]);
+            inFragment_ = true;
+            if (nalType >= 16 && nalType <= 21) sawIdr_ = true;
+        } else if (!inFragment_) {
+            corrupt_ = true;
+        }
+        au_.insert(au_.end(), p + 3, p + n);
+        if (end) inFragment_ = false;
+    } else if (type == 48) {                // aggregation packet
+        int pos = 2;
+        while (pos + 2 <= n) {
+            const int size = (p[pos] << 8) | p[pos + 1];
+            pos += 2;
+            if (size <= 0 || pos + size > n) { corrupt_ = true; break; }
+            const int inner = (p[pos] >> 1) & 0x3F;
+            if (inner >= 16 && inner <= 21) sawIdr_ = true;
+            startNal(p + pos, size);
+            pos += size;
+        }
+    } else {
+        if (type >= 16 && type <= 21) sawIdr_ = true;
+        startNal(p, n);
+    }
+
+    if (marker) emit(ts);
+}
+
 void Depacketizer::push(const uint8_t* pkt, int len) {
     if (len < 13) return;
     if ((pkt[0] >> 6) != 2) return;                       // RTP version
@@ -73,6 +114,12 @@ void Depacketizer::push(const uint8_t* pkt, int len) {
 
     const uint8_t* p = pkt + offset;
     const int n = len - offset;
+
+    if (hevc_) {
+        pushHevc(p, n, marker, ts);
+        return;
+    }
+
     const int type = p[0] & 0x1F;
 
     if (type == kFuA) {

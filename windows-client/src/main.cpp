@@ -50,6 +50,45 @@ constexpr int kMenuStabilize = 103;
 constexpr int kMenuShortExposure = 104;
 constexpr int kMenuLevel = 105;
 
+// Capture settings, owned here and pushed to the phone. Menu ids for the dynamic entries
+// start above the fixed ones.
+constexpr int kMenuCameraBase = 200;
+constexpr int kMenuSizeBase = 300;
+constexpr int kMenuFpsBase = 400;
+constexpr int kMenuBitrateBase = 500;
+constexpr int kMenuCodecBase = 600;
+
+struct PhoneMode {
+    uint16_t width = 0, height = 0;
+    std::vector<uint8_t> fps;          // rates this resolution can actually hold
+};
+
+struct PhoneCamera {
+    std::string id;
+    std::string label;
+    std::vector<PhoneMode> modes;
+};
+
+struct Capabilities {
+    std::vector<PhoneCamera> cameras;
+};
+
+struct Config {
+    std::string cameraId;
+    uint16_t width = 2560, height = 1440;
+    uint8_t fps = 30;
+    uint32_t bitrate = 20'000'000;
+    bool hevc = false;
+};
+
+const uint32_t kBitrateChoices[] = {4'000'000,  6'000'000,  8'000'000,  12'000'000,
+                                    16'000'000, 20'000'000, 25'000'000, 30'000'000, 40'000'000};
+
+std::mutex g_configLock;
+Capabilities g_capabilities;
+Config g_config;
+std::atomic<bool> g_configDirty{false};
+
 std::atomic<bool> g_stabilize{false};
 std::atomic<bool> g_shortExposure{false};
 std::atomic<bool> g_level{false};
@@ -99,6 +138,7 @@ struct Options {
     bool gyroCheck = false;
     bool warpTest = false;
     bool levelTest = false;
+    bool listDecoders = false;
     std::string analyze;
     std::wstring selftest;
 };
@@ -317,7 +357,7 @@ int runGyroCheck(const Options& options) {
 
     const StreamParams& p = session.params();
     H264Decoder decoder;
-    if (!decoder.init(p.width, p.height, p.fps ? p.fps : 30, &err)) {
+    if (!decoder.init(p.width, p.height, p.fps ? p.fps : 30, p.hevc, &err)) {
         printf("decoder: %s\n", err.c_str());
         return 1;
     }
@@ -411,6 +451,7 @@ int runGyroCheck(const Options& options) {
            options.seconds > 0 ? options.seconds : 15);
 
     Depacketizer depack;
+    depack.setHevc(p.hevc);
     depack.setCallback([&](const uint8_t* data, size_t size, uint32_t ts, bool) {
         decoder.decode(data, size, int64_t(ts) * 1000 / 9, [&](IMFSample* sample) {
             if (!decoder.copyNv12(sample, nv12)) return;
@@ -971,6 +1012,43 @@ int runAnalyze(const std::string& path) {
     return 0;
 }
 
+/** Which decoders Media Foundation can give us, per codec. */
+int runListDecoders() {
+    attachConsole();
+    CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    MFStartup(MF_VERSION, MFSTARTUP_LITE);
+
+    struct Codec { const char* name; GUID subtype; };
+    const Codec codecs[] = {{"H.264", MFVideoFormat_H264}, {"HEVC", MFVideoFormat_HEVC}};
+    const struct { const char* label; UINT32 flags; } kinds[] = {
+        {"sync", MFT_ENUM_FLAG_SYNCMFT | MFT_ENUM_FLAG_LOCALMFT | MFT_ENUM_FLAG_SORTANDFILTER},
+        {"async/hardware", MFT_ENUM_FLAG_ASYNCMFT | MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER},
+    };
+
+    for (const Codec& codec : codecs) {
+        for (const auto& kind : kinds) {
+            MFT_REGISTER_TYPE_INFO input{MFMediaType_Video, codec.subtype};
+            IMFActivate** activates = nullptr;
+            UINT32 count = 0;
+            const HRESULT hr = MFTEnumEx(MFT_CATEGORY_VIDEO_DECODER, kind.flags, &input, nullptr,
+                                         &activates, &count);
+            printf("%s %s: %u\n", codec.name, kind.label, SUCCEEDED(hr) ? count : 0);
+            for (UINT32 i = 0; i < count; ++i) {
+                LPWSTR name = nullptr;
+                if (SUCCEEDED(activates[i]->GetAllocatedString(MFT_FRIENDLY_NAME_Attribute, &name,
+                                                               nullptr))) {
+                    printf("    %ls\n", name);
+                    CoTaskMemFree(name);
+                }
+                activates[i]->Release();
+            }
+            CoTaskMemFree(activates);
+        }
+    }
+    MFShutdown();
+    return 0;
+}
+
 /** Lists the video capture devices Media Foundation sees, virtual cameras included. */
 int runList() {
     attachConsole();
@@ -1222,6 +1300,8 @@ void workerLoop(Options options, HWND window) {
     bool announcedStabilization = false;
     bool loggedSkew = false;
     bool shortExposureWas = false;
+    bool capabilitiesArrived = false;
+    bool configPushed = false;
     uint64_t stabilizedFrames = 0;
 
     uint64_t telemetryPackets = 0, foreignPackets = 0, decodedFrames = 0;
@@ -1285,6 +1365,58 @@ void workerLoop(Options options, HWND window) {
                 stabilizer.addGravity(readF32(body), readF32(body + 4), readF32(body + 8));
                 break;
             }
+            case kCapabilities: {
+                if (size < 1) return;
+                Capabilities caps;
+                int at = 1;
+                const int cameraCount = body[0];
+                for (int i = 0; i < cameraCount && at < size; ++i) {
+                    PhoneCamera camera;
+                    const int idLength = body[at++];
+                    if (at + idLength > size) break;
+                    camera.id.assign(reinterpret_cast<const char*>(body + at), size_t(idLength));
+                    at += idLength;
+                    const int labelLength = body[at++];
+                    if (at + labelLength > size) break;
+                    camera.label.assign(reinterpret_cast<const char*>(body + at), size_t(labelLength));
+                    at += labelLength;
+                    const int modeCount = body[at++];
+                    for (int m = 0; m < modeCount && at + 5 <= size; ++m) {
+                        PhoneMode mode;
+                        mode.width = readU16(body + at);
+                        mode.height = readU16(body + at + 2);
+                        at += 4;
+                        const int rates = body[at++];
+                        for (int r = 0; r < rates && at < size; ++r) mode.fps.push_back(body[at++]);
+                        camera.modes.push_back(std::move(mode));
+                    }
+                    caps.cameras.push_back(std::move(camera));
+                }
+                if (!caps.cameras.empty()) {
+                    capabilitiesArrived = true;
+                    std::lock_guard<std::mutex> guard(g_configLock);
+                    const bool first = g_capabilities.cameras.empty();
+                    g_capabilities = std::move(caps);
+                    if (first) {
+                        for (const PhoneCamera& camera : g_capabilities.cameras) {
+                            std::string modes;
+                            for (const PhoneMode& mode : camera.modes) {
+                                modes += " " + std::to_string(mode.width) + "x" +
+                                         std::to_string(mode.height) + "@";
+                                for (uint8_t rate : mode.fps) modes += std::to_string(rate) + "/";
+                            }
+                            logf("camera %s '%s':%s", camera.id.c_str(), camera.label.c_str(),
+                                 modes.c_str());
+                        }
+                    }
+                    bool known = false;
+                    for (const PhoneCamera& camera : g_capabilities.cameras) {
+                        known = known || camera.id == g_config.cameraId;
+                    }
+                    if (!known) g_config.cameraId = g_capabilities.cameras.front().id;
+                }
+                break;
+            }
             case kSensorLimits: {
                 if (size < 24) return;
                 exposureControl.setLimits(readI32(body), readI32(body + 4), readI64(body + 8),
@@ -1311,6 +1443,8 @@ void workerLoop(Options options, HWND window) {
         }
     };
 
+    std::vector<uint16_t> accumulator;
+    uint32_t averaging = 1, accumulated = 0, currentFps = 30;
     uint64_t published = 0, lastPublished = 0, lastBytes = 0;
     uint64_t nextReport = nowMs() + 1000, nextConnect = 0;
     bool streaming = false;
@@ -1385,6 +1519,23 @@ void workerLoop(Options options, HWND window) {
         }
 
         const size_t outSize = size_t(kMaxWidth) * kMaxHeight * 3 / 2;
+
+        // Above 30 fps the extra frames are averaged rather than dropped: at 120 fps the
+        // exposure is at most 8 ms, and stacking four of them buys back the light (and
+        // halves the noise) that the short exposure gave away. Stabilized frames are
+        // already warped onto a common orientation, so they stack without ghosting from
+        // camera shake.
+        if (averaging > 1) {
+            if (accumulator.size() != outSize) accumulator.assign(outSize, 0);
+            if (accumulated == 0) std::fill(accumulator.begin(), accumulator.end(), 0);
+            for (size_t i = 0; i < outSize; ++i) accumulator[i] += out[i];
+            if (++accumulated < averaging) return;
+            for (size_t i = 0; i < outSize; ++i) {
+                out[i] = uint8_t((accumulator[i] + averaging / 2) / averaging);
+            }
+            accumulated = 0;
+        }
+
         flipNv12(out, kMaxWidth, kMaxHeight, g_flipH, g_flipV);
         channel.publish(out, outSize, kMaxWidth, kMaxHeight, 0);
         published++;
@@ -1399,7 +1550,10 @@ void workerLoop(Options options, HWND window) {
             const FrameTiming timing = it != frameTimes.end() ? it->second : FrameTiming{};
             const bool usable = g_stabilize && timing.sensorNs != 0 && stabilizer.geometry().valid();
             const bool ready = usable && stabilizer.ready(timing.sensorNs + timing.skewNs);
-            const bool expired = nowMs() - f.arrivedMs > 250;
+            // Rate-aware: a fixed 250 ms wait is four frames at 30 fps but thirty at 120,
+            // and that shows up as a latency spike whenever the gyro window is not ready.
+            const uint64_t patience = (std::max)(uint64_t(60), 4000ull / (std::max)(1u, uint32_t(currentFps)));
+            const bool expired = nowMs() - f.arrivedMs > patience;
             // The queue is the look-ahead buffer; once it is full the oldest frame has
             // to go out as-is rather than be dropped.
             const bool overflowing = pendingFrames.size() > 6;
@@ -1416,9 +1570,27 @@ void workerLoop(Options options, HWND window) {
         }
     };
 
+    // Depacketizing is a memcpy, decoding is not: assembled frames are queued here and
+    // decoded after the socket has been drained, so a slow decode cannot cost us packets.
+    struct AccessUnit {
+        std::vector<uint8_t> data;
+        uint32_t ts = 0;
+    };
+    std::vector<AccessUnit> readyUnits;
+
     depack.setCallback([&](const uint8_t* data, size_t size, uint32_t ts, bool) {
-        if (!decoder) return;
-        decoder->decode(data, size, int64_t(ts) * 1000 / 9, [&](IMFSample* sample) {
+        AccessUnit unit;
+        unit.data.assign(data, data + size);
+        unit.ts = ts;
+        readyUnits.push_back(std::move(unit));
+    });
+
+    auto decodeReady = [&]() {
+        if (!decoder) { readyUnits.clear(); return; }
+        for (AccessUnit& unit : readyUnits) {
+            const uint32_t ts = unit.ts;
+            decoder->decode(unit.data.data(), unit.data.size(), int64_t(ts) * 1000 / 9,
+                            [&](IMFSample* sample) {
             decodedFrames++;
             if (!decoder->copyNv12(sample, nv12)) return;
 
@@ -1450,8 +1622,10 @@ void workerLoop(Options options, HWND window) {
             f.rtpTimestamp = ts;
             f.arrivedMs = nowMs();
             pendingFrames.push_back(std::move(f));
-        });
-    });
+            });
+        }
+        readyUnits.clear();
+    };
 
     while (!g_quit) {
         // 1. keep a link with the phone whenever one is reachable
@@ -1460,6 +1634,13 @@ void workerLoop(Options options, HWND window) {
             session = link(options, &phoneIp);
             if (session) {
                 logf("linked to %s", phoneIp.c_str());
+                {   // push our settings; the phone only holds defaults until we speak
+                    std::lock_guard<std::mutex> guard(g_configLock);
+                    if (!g_config.cameraId.empty()) {
+                        session->setConfig(g_config.cameraId, g_config.width, g_config.height,
+                                           g_config.fps, g_config.bitrate, g_config.hevc);
+                    }
+                }
                 const StreamParams& p = session->params();
                 status.phone = phoneIp;
                 status.width = p.width;
@@ -1483,7 +1664,7 @@ void workerLoop(Options options, HWND window) {
             const StreamParams& p = session->params();
             decoder = std::make_unique<H264Decoder>();
             std::string err;
-            if (!decoder->init(p.width, p.height, p.fps ? p.fps : 30, &err)) {
+            if (!decoder->init(p.width, p.height, p.fps ? p.fps : 30, p.hevc, &err)) {
                 status.error = "decoder: " + err;
                 setStatus(status);
                 decoder.reset();
@@ -1491,6 +1672,12 @@ void workerLoop(Options options, HWND window) {
                 continue;
             }
             depack.reset();
+            depack.setHevc(session->params().hevc);
+            averaging = p.fps > 30 ? (std::max)(1u, uint32_t(p.fps) / 30u) : 1u;
+            accumulated = 0;
+            currentFps = (std::max)(1u, uint32_t(p.fps));
+            if (averaging > 1) logf("averaging %u frames: %u fps in, %u fps out", averaging, p.fps,
+                                    p.fps / averaging);
             stabilizer.reset();
             exposureControl.reset();
             pendingFrames.clear();
@@ -1510,6 +1697,38 @@ void workerLoop(Options options, HWND window) {
             status.state = session ? LinkState::Linked : LinkState::NoPhone;
             status.kbps = 0;
             setStatus(status);
+        }
+
+        // The camera list only arrives after the link is up, so our stored settings are
+        // pushed once it does - and only when they differ from what the phone is running.
+        if (session && capabilitiesArrived && !configPushed) {
+            configPushed = true;
+            const StreamParams& p = session->params();
+            std::lock_guard<std::mutex> guard(g_configLock);
+            if (p.width != g_config.width || p.height != g_config.height ||
+                p.fps != g_config.fps || p.hevc != g_config.hevc) {
+                g_configDirty = true;
+            }
+        }
+
+        // A settings change goes to the phone, then the link is dropped: the reconnect
+        // brings a fresh HELLO_ACK with the new size and codec, so the decoder is rebuilt
+        // from what the phone actually applied rather than what we hoped for.
+        if (session && g_configDirty.exchange(false)) {
+            std::lock_guard<std::mutex> guard(g_configLock);
+            logf("config -> phone: %s %ux%u@%u %u kbps %s", g_config.cameraId.c_str(),
+                 g_config.width, g_config.height, g_config.fps, g_config.bitrate / 1000,
+                 g_config.hevc ? "HEVC" : "H.264");
+            session->setConfig(g_config.cameraId, g_config.width, g_config.height, g_config.fps,
+                               g_config.bitrate, g_config.hevc);
+            session->bye();
+            session.reset();
+            decoder.reset();
+            streaming = false;
+            pendingFrames.clear();
+            nextConnect = nowMs() + 400;
+            configPushed = false;
+            continue;
         }
 
         if (session && streaming && announcedStabilization != g_stabilize) {
@@ -1552,6 +1771,7 @@ void workerLoop(Options options, HWND window) {
                 setStatus(status);
                 continue;
             }
+            decodeReady();
             if (streaming && depack.takeNeedIdr()) session->requestIdr();
             drainPending();
         } else {
@@ -1600,6 +1820,147 @@ void workerLoop(Options options, HWND window) {
 
 // ------------------------------------------------------------------ window
 
+/** Camera / resolution / frame rate / bitrate / codec submenus, built from what the phone
+ *  reported. Until it connects there is nothing to choose from, so they stay disabled. */
+void appendCaptureMenus(HMENU menu) {
+    std::lock_guard<std::mutex> guard(g_configLock);
+    if (g_capabilities.cameras.empty()) {
+        AppendMenuW(menu, MF_STRING | MF_DISABLED, 0, L"Capture settings (waiting for the phone)");
+        return;
+    }
+
+    HMENU cameras = CreatePopupMenu();
+    for (size_t i = 0; i < g_capabilities.cameras.size(); ++i) {
+        const PhoneCamera& camera = g_capabilities.cameras[i];
+        const bool current = camera.id == g_config.cameraId;
+        AppendMenuW(cameras, MF_STRING | (current ? MF_CHECKED : 0), kMenuCameraBase + int(i),
+                    widen(camera.label).c_str());
+    }
+    AppendMenuW(menu, MF_STRING | MF_POPUP, reinterpret_cast<UINT_PTR>(cameras), L"Camera");
+
+    HMENU sizes = CreatePopupMenu();
+    const PhoneCamera* active = nullptr;
+    for (const PhoneCamera& camera : g_capabilities.cameras) {
+        if (camera.id == g_config.cameraId) active = &camera;
+    }
+    const PhoneMode* activeMode = nullptr;
+    if (active) {
+        for (size_t i = 0; i < active->modes.size(); ++i) {
+            const PhoneMode& mode = active->modes[i];
+            const bool current = mode.width == g_config.width && mode.height == g_config.height;
+            if (current) activeMode = &mode;
+            wchar_t label[48];
+            // Show what each resolution can do, so the frame-rate limits are not a surprise.
+            swprintf_s(label, L"%ux%u  (max %u fps)", mode.width, mode.height,
+                       mode.fps.empty() ? 30 : mode.fps.back());
+            AppendMenuW(sizes, MF_STRING | (current ? MF_CHECKED : 0), kMenuSizeBase + int(i), label);
+        }
+    }
+    AppendMenuW(menu, MF_STRING | MF_POPUP, reinterpret_cast<UINT_PTR>(sizes), L"Resolution");
+
+    HMENU rates = CreatePopupMenu();
+    if (activeMode) {
+        for (size_t i = 0; i < activeMode->fps.size(); ++i) {
+            const uint8_t rate = activeMode->fps[i];
+            wchar_t label[64];
+            if (rate > 30) {
+                swprintf_s(label, L"%u fps  (averaged to %u out)", rate, rate / (rate / 30));
+            } else {
+                swprintf_s(label, L"%u fps", rate);
+            }
+            AppendMenuW(rates, MF_STRING | (rate == g_config.fps ? MF_CHECKED : 0),
+                        kMenuFpsBase + int(i), label);
+        }
+    }
+    AppendMenuW(menu, MF_STRING | MF_POPUP, reinterpret_cast<UINT_PTR>(rates), L"Frame rate");
+
+    HMENU bitrates = CreatePopupMenu();
+    for (size_t i = 0; i < ARRAYSIZE(kBitrateChoices); ++i) {
+        wchar_t label[32];
+        swprintf_s(label, L"%u Mbps", kBitrateChoices[i] / 1'000'000);
+        AppendMenuW(bitrates, MF_STRING | (kBitrateChoices[i] == g_config.bitrate ? MF_CHECKED : 0),
+                    kMenuBitrateBase + int(i), label);
+    }
+    AppendMenuW(menu, MF_STRING | MF_POPUP, reinterpret_cast<UINT_PTR>(bitrates), L"Bitrate");
+
+    HMENU codecs = CreatePopupMenu();
+    AppendMenuW(codecs, MF_STRING | (g_config.hevc ? 0 : MF_CHECKED), kMenuCodecBase + 0, L"H.264");
+    AppendMenuW(codecs, MF_STRING | (g_config.hevc ? MF_CHECKED : 0), kMenuCodecBase + 1, L"HEVC");
+    AppendMenuW(menu, MF_STRING | MF_POPUP, reinterpret_cast<UINT_PTR>(codecs), L"Codec");
+}
+
+/** Applies a menu pick to the configuration; returns true if the phone must be told. */
+bool applyMenuChoice(int id) {
+    std::lock_guard<std::mutex> guard(g_configLock);
+    const PhoneCamera* active = nullptr;
+    for (const PhoneCamera& camera : g_capabilities.cameras) {
+        if (camera.id == g_config.cameraId) active = &camera;
+    }
+
+    if (id >= kMenuCodecBase) {
+        g_config.hevc = (id - kMenuCodecBase) != 0;
+    } else if (id >= kMenuBitrateBase) {
+        const size_t index = size_t(id - kMenuBitrateBase);
+        if (index >= ARRAYSIZE(kBitrateChoices)) return false;
+        g_config.bitrate = kBitrateChoices[index];
+    } else if (id >= kMenuFpsBase) {
+        const PhoneMode* mode = nullptr;
+        if (active) {
+            for (const PhoneMode& m : active->modes) {
+                if (m.width == g_config.width && m.height == g_config.height) mode = &m;
+            }
+        }
+        const size_t index = size_t(id - kMenuFpsBase);
+        if (!mode || index >= mode->fps.size()) return false;
+        g_config.fps = mode->fps[index];
+    } else if (id >= kMenuSizeBase) {
+        const size_t index = size_t(id - kMenuSizeBase);
+        if (!active || index >= active->modes.size()) return false;
+        const PhoneMode& mode = active->modes[index];
+        g_config.width = mode.width;
+        g_config.height = mode.height;
+        // The new resolution may not reach the current rate: 240 fps only exists at 720p.
+        bool holds = false;
+        for (uint8_t rate : mode.fps) holds = holds || rate == g_config.fps;
+        if (!holds && !mode.fps.empty()) {
+            uint8_t best = mode.fps.front();
+            for (uint8_t rate : mode.fps) if (rate <= 30) best = rate;
+            g_config.fps = best;
+        }
+    } else {
+        const size_t index = size_t(id - kMenuCameraBase);
+        if (index >= g_capabilities.cameras.size()) return false;
+        const PhoneCamera& camera = g_capabilities.cameras[index];
+        g_config.cameraId = camera.id;
+        // Keep the resolution if the new sensor has it, otherwise take its best.
+        const PhoneMode* keep = nullptr;
+        for (const PhoneMode& mode : camera.modes) {
+            if (mode.width == g_config.width && mode.height == g_config.height) keep = &mode;
+        }
+        if (!keep && !camera.modes.empty()) {
+            g_config.width = camera.modes.front().width;
+            g_config.height = camera.modes.front().height;
+            keep = &camera.modes.front();
+        }
+        if (keep) {
+            bool holds = false;
+            for (uint8_t rate : keep->fps) holds = holds || rate == g_config.fps;
+            if (!holds && !keep->fps.empty()) {
+                uint8_t best = keep->fps.front();
+                for (uint8_t rate : keep->fps) if (rate <= 30) best = rate;
+                g_config.fps = best;
+            }
+        }
+    }
+
+    saveSetting(L"Fps", g_config.fps);
+    saveSetting(L"Bitrate", g_config.bitrate);
+    saveSetting(L"Hevc", g_config.hevc ? 1 : 0);
+    saveSetting(L"Width", g_config.width);
+    saveSetting(L"Height", g_config.height);
+    return true;
+}
+
 LRESULT CALLBACK wndProc(HWND window, UINT message, WPARAM wparam, LPARAM lparam) {
     switch (message) {
         case WM_TIMER:
@@ -1618,6 +1979,8 @@ LRESULT CALLBACK wndProc(HWND window, UINT message, WPARAM wparam, LPARAM lparam
                     swprintf_s(stats, L"lost packets %llu, dropped frames %llu", s.lost, s.dropped);
                     AppendMenuW(menu, MF_STRING | MF_DISABLED, 0, stats);
                 }
+                AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+                appendCaptureMenus(menu);
                 AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
                 AppendMenuW(menu, MF_STRING | (g_flipH ? MF_CHECKED : MF_UNCHECKED), kMenuFlipH,
                             L"Mirror horizontally");
@@ -1671,6 +2034,11 @@ LRESULT CALLBACK wndProc(HWND window, UINT message, WPARAM wparam, LPARAM lparam
                 case kMenuLevel:
                     g_level = !g_level;
                     saveSetting(L"LevelHorizon", g_level ? 1 : 0);
+                    break;
+                default:
+                    if (LOWORD(wparam) >= kMenuCameraBase && applyMenuChoice(LOWORD(wparam))) {
+                        g_configDirty = true;
+                    }
                     break;
             }
             return 0;
@@ -1744,7 +2112,7 @@ int runTest(const Options& options) {
            p.width, p.height, p.fps, p.bitrate / 1000, p.ssrc, p.rtpSourcePort);
 
     H264Decoder decoder;
-    if (!decoder.init(p.width, p.height, p.fps ? p.fps : 30, &err)) {
+    if (!decoder.init(p.width, p.height, p.fps ? p.fps : 30, p.hevc, &err)) {
         printf("decoder: %s\n", err.c_str());
         return 1;
     }
@@ -1754,6 +2122,7 @@ int runTest(const Options& options) {
     if (!options.dump.empty()) fopen_s(&dump, options.dump.c_str(), "wb");
 
     Depacketizer depack;
+    depack.setHevc(p.hevc);
     uint64_t decoded = 0;
     bool savedFrame = false;
     std::vector<uint8_t> nv12;
@@ -1840,6 +2209,7 @@ Options parse(int argc, wchar_t** argv) {
         else if (a == L"--analyze") options.analyze = next();
         else if (a == L"--warptest") options.warpTest = true;
         else if (a == L"--leveltest") options.levelTest = true;
+        else if (a == L"--decoders") options.listDecoders = true;
         else if (a == L"--selftest") options.selftest = (i + 1 < argc) ? argv[++i] : L"awc-source.dll";
     }
     return options;
@@ -1860,12 +2230,18 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
     g_stabilize = loadSetting(L"GyroStabilize", 0) != 0;
     g_shortExposure = loadSetting(L"ShortExposure", 0) != 0;
     g_level = loadSetting(L"LevelHorizon", 0) != 0;
+    g_config.fps = uint8_t(loadSetting(L"Fps", 30));
+    g_config.bitrate = loadSetting(L"Bitrate", 20'000'000);
+    g_config.hevc = loadSetting(L"Hevc", 0) != 0;
+    g_config.width = uint16_t(loadSetting(L"Width", 2560));
+    g_config.height = uint16_t(loadSetting(L"Height", 1440));
     if (!options.selftest.empty()) return runSelfTest(options.selftest);
     if (options.capture) return runCapture(L"AndroidWebCam", options.frame);
     if (options.gyroCheck) return runGyroCheck(options);
     if (!options.analyze.empty()) return runAnalyze(options.analyze);
     if (options.warpTest) return runWarpTest();
     if (options.levelTest) return runLevelTest();
+    if (options.listDecoders) return runListDecoders();
     if (options.list) return runList();
     return options.test ? runTest(options) : runTray(options);
 }

@@ -17,7 +17,9 @@ import java.nio.ByteBuffer
 class RtpSink(
     private val target: InetAddress,
     private val port: Int,
-    private val ssrc: Int
+    private val ssrc: Int,
+    /** true = HEVC payload format (RFC 7798), false = H.264 (RFC 6184). */
+    @Volatile var hevc: Boolean = false
 ) : VideoSink {
 
     private val socket = DatagramSocket().apply {
@@ -52,17 +54,28 @@ class RtpSink(
     private val out = ByteArray(MTU)
 
     private var seq = 0
-    private var sps: ByteArray? = null
-    private var pps: ByteArray? = null
 
     @Volatile var bytesSent = 0L; private set
     @Volatile var packetsSent = 0L; private set
     @Volatile var framesSent = 0L; private set
 
+    /** Parameter sets, resent before every IDR so a receiver can join at any time. */
+    private var parameterSets: List<ByteArray> = emptyList()
+
     override fun onFormat(format: MediaFormat) {
-        sps = format.getByteBuffer("csd-0")?.let { stripStartCode(it) }
-        pps = format.getByteBuffer("csd-1")?.let { stripStartCode(it) }
-        Log.i(TAG, "csd: sps=${sps?.size} pps=${pps?.size} -> $target:$port")
+        // H.264 splits SPS and PPS across csd-0/csd-1; HEVC packs VPS+SPS+PPS into csd-0.
+        val sets = ArrayList<ByteArray>(3)
+        listOf("csd-0", "csd-1").forEach { key ->
+            format.getByteBuffer(key)?.let { buffer ->
+                val bytes = ByteArray(buffer.remaining())
+                buffer.duplicate().get(bytes)
+                splitNals(bytes).forEach { (offset, length) ->
+                    sets.add(bytes.copyOfRange(offset, offset + length))
+                }
+            }
+        }
+        parameterSets = sets
+        Log.i(TAG, "csd: ${sets.size} parameter sets ${sets.map { it.size }} -> $target:$port")
     }
 
     override fun onEncoded(data: ByteBuffer, info: MediaCodec.BufferInfo) {
@@ -75,10 +88,11 @@ class RtpSink(
         if (nals.isEmpty()) return
 
         val ts = ((info.presentationTimeUs * 90L) / 1000L).toInt()
-        val types = nals.map { au[it.first].toInt() and 0x1F }
-        if (types.contains(NAL_IDR) && !types.contains(NAL_SPS)) {
-            sps?.let { sendNal(it, 0, it.size, ts, false) }
-            pps?.let { sendNal(it, 0, it.size, ts, false) }
+        val types = nals.map { nalType(au, it.first) }
+        val hasKeyFrame = types.any { if (hevc) it in 16..21 else it == NAL_IDR }
+        val hasParameterSet = types.any { if (hevc) it in 32..34 else it == NAL_SPS }
+        if (hasKeyFrame && !hasParameterSet) {
+            parameterSets.forEach { sendNal(it, 0, it.size, ts, false) }
         }
         nals.forEachIndexed { i, r ->
             sendNal(au, r.first, r.second, ts, i == nals.lastIndex)
@@ -110,6 +124,9 @@ class RtpSink(
 
     // ---- packetization ----
 
+    private fun nalType(data: ByteArray, offset: Int): Int =
+        if (hevc) (data[offset].toInt() shr 1) and 0x3F else data[offset].toInt() and 0x1F
+
     private fun sendNal(src: ByteArray, off: Int, len: Int, ts: Int, marker: Boolean) {
         if (len <= MTU - RTP_HEADER) {
             writeHeader(ts, marker)
@@ -117,10 +134,15 @@ class RtpSink(
             send(RTP_HEADER + len)
             return
         }
-        // FU-A: strip the original 1-byte NAL header, replace with indicator + FU header
+        if (hevc) sendFragmentedHevc(src, off, len, ts, marker)
+        else sendFragmentedAvc(src, off, len, ts, marker)
+    }
+
+    /** RFC 6184 FU-A: one-byte NAL header replaced by indicator + FU header. */
+    private fun sendFragmentedAvc(src: ByteArray, off: Int, len: Int, ts: Int, marker: Boolean) {
         val nalHeader = src[off].toInt() and 0xFF
         val indicator = ((nalHeader and 0xE0) or FU_A).toByte()
-        val type = (nalHeader and 0x1F).toByte()
+        val type = nalHeader and 0x1F
         val max = MTU - RTP_HEADER - 2
 
         var pos = off + 1
@@ -131,11 +153,42 @@ class RtpSink(
             val last = chunk == left
             writeHeader(ts, marker && last)
             out[RTP_HEADER] = indicator
-            out[RTP_HEADER + 1] = (type.toInt() or
+            out[RTP_HEADER + 1] = (type or
                     (if (first) 0x80 else 0) or
                     (if (last) 0x40 else 0)).toByte()
             System.arraycopy(src, pos, out, RTP_HEADER + 2, chunk)
             send(RTP_HEADER + 2 + chunk)
+            pos += chunk
+            left -= chunk
+            first = false
+        }
+    }
+
+    /**
+     * RFC 7798 fragmentation unit. HEVC NAL headers are two bytes, and the payload header
+     * keeps the original layer/temporal id with the type replaced by 49.
+     */
+    private fun sendFragmentedHevc(src: ByteArray, off: Int, len: Int, ts: Int, marker: Boolean) {
+        val type = (src[off].toInt() shr 1) and 0x3F
+        val layerAndTid = ((src[off].toInt() and 0x01) shl 8) or (src[off + 1].toInt() and 0xFF)
+        val header0 = ((49 shl 1) or (layerAndTid shr 8)).toByte()
+        val header1 = (layerAndTid and 0xFF).toByte()
+        val max = MTU - RTP_HEADER - 3
+
+        var pos = off + 2
+        var left = len - 2
+        var first = true
+        while (left > 0) {
+            val chunk = minOf(max, left)
+            val last = chunk == left
+            writeHeader(ts, marker && last)
+            out[RTP_HEADER] = header0
+            out[RTP_HEADER + 1] = header1
+            out[RTP_HEADER + 2] = (type or
+                    (if (first) 0x80 else 0) or
+                    (if (last) 0x40 else 0)).toByte()
+            System.arraycopy(src, pos, out, RTP_HEADER + 3, chunk)
+            send(RTP_HEADER + 3 + chunk)
             pos += chunk
             left -= chunk
             first = false
@@ -192,18 +245,6 @@ class RtpSink(
             val end = if (idx + 1 < scStart.size) scStart[idx + 1] else b.size
             start to (end - start)
         }.filter { it.second > 0 }
-    }
-
-    private fun stripStartCode(buf: ByteBuffer): ByteArray {
-        val b = ByteArray(buf.remaining())
-        buf.duplicate().get(b)
-        var i = 0
-        while (i + 3 < b.size && b[i].toInt() == 0 && b[i + 1].toInt() == 0) {
-            if (b[i + 2].toInt() == 1) { i += 3; break }
-            if (b[i + 2].toInt() == 0 && b[i + 3].toInt() == 1) { i += 4; break }
-            i++
-        }
-        return b.copyOfRange(i, b.size)
     }
 
     companion object {

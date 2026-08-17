@@ -36,6 +36,8 @@ class Telemetry(context: Context, private val send: (ByteArray) -> Unit) : Senso
 
     fun start(): Boolean {
         if (gyro == null) { Log.w(TAG, "no gyroscope"); return false }
+        if (started) return true
+        started = true
         thread.start()
         val handler = Handler(thread.looper)
         val ok = sensors.registerListener(this, gyro, RATE_US, handler)
@@ -49,10 +51,13 @@ class Telemetry(context: Context, private val send: (ByteArray) -> Unit) : Senso
         return ok
     }
 
+    private var started = false
+
     fun stop() {
         sensors.unregisterListener(this)
         flush()
-        thread.quitSafely()
+        if (started) thread.quitSafely()
+        started = false
     }
 
     private var cameraInfo: ByteArray? = null
@@ -70,6 +75,38 @@ class Telemetry(context: Context, private val send: (ByteArray) -> Unit) : Senso
     }
 
     private var sensorLimits: ByteArray? = null
+    private var capabilities: ByteArray? = null
+
+    /**
+     * Cameras with their 16:9 modes. Frame rates are per resolution on purpose: 120 fps
+     * only exists up to 1080p and 240 fps only up to 720p, so a single global list would
+     * offer the PC settings that cannot be applied.
+     */
+    fun sendCapabilities(cameras: List<Cameras.Info>) {
+        val bodySize = cameras.sumOf { camera ->
+            1 + camera.id.toByteArray().size + 1 + camera.label.toByteArray(Charsets.UTF_8).size +
+                    1 + camera.modes.sumOf { 5 + it.fps.size }
+        } + 1
+        val b = Control.buffer(Control.CAPABILITIES, bodySize).put(cameras.size.toByte())
+        cameras.forEach { camera ->
+            val id = camera.id.toByteArray()
+            val label = camera.label.toByteArray(Charsets.UTF_8)
+            b.put(id.size.toByte()).put(id).put(label.size.toByte()).put(label)
+            b.put(camera.modes.size.toByte())
+            camera.modes.forEach { mode ->
+                b.putShort(mode.size.width.toShort()).putShort(mode.size.height.toShort())
+                b.put(mode.fps.size.toByte())
+                mode.fps.forEach { b.put(it.toByte()) }
+            }
+        }
+        capabilities = b.array()
+        // Sent before any periodic telemetry exists, so repeat it: one lost datagram would
+        // otherwise leave the PC menus empty until a stream starts.
+        repeat(3) { send(b.array()) }
+        Log.i(TAG, "capabilities: " + cameras.joinToString { c ->
+            "${c.label}[" + c.modes.joinToString(";") { "${it.size}=${it.fps}" } + "]"
+        })
+    }
 
     /** Exposure and ISO limits, so the PC can drive them without guessing. */
     fun sendSensorLimits(isoMin: Int, isoMax: Int, exposureMinNs: Long, exposureMaxNs: Long) {
@@ -87,6 +124,7 @@ class Telemetry(context: Context, private val send: (ByteArray) -> Unit) : Senso
         lastInfoSent = now
         send(info)
         sensorLimits?.let { send(it) }
+        capabilities?.let { send(it) }
     }
 
     override fun onSensorChanged(event: SensorEvent) {

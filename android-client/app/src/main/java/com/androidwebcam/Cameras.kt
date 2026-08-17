@@ -72,8 +72,31 @@ object Cameras {
             .codecInfos.filter { it.isEncoder && it.supportedTypes.any { t -> t.startsWith("video/") } }
             .joinToString { "${it.name}:${it.supportedTypes.joinToString("|")}" }
 
+        // Minimum frame duration is what decides whether 60 fps is reachable in a normal
+        // session: with MANUAL_SENSOR we can set SENSOR_FRAME_DURATION directly.
+        val durations = listOf(Size(1920, 1080), Size(2560, 1440), Size(1280, 720)).mapNotNull { s ->
+            val ns = runCatching { map?.getOutputMinFrameDuration(MediaCodec::class.java, s) }
+                .getOrNull() ?: return@mapNotNull null
+            if (ns <= 0) null else "$s: min ${ns / 1000}us (max ${1_000_000_000 / ns} fps)"
+        }
+        val hevc = android.media.MediaCodecList(android.media.MediaCodecList.REGULAR_CODECS)
+            .codecInfos.firstOrNull { it.isEncoder && it.supportedTypes.contains("video/hevc") && it.name.startsWith("c2.qti") }
+        val hevcInfo = hevc?.getCapabilitiesForType("video/hevc")?.videoCapabilities?.let { v ->
+            "${hevc.name} 1080p60=${v.areSizeAndRateSupported(1920, 1080, 60.0)} " +
+                    "1080p120=${v.areSizeAndRateSupported(1920, 1080, 120.0)} " +
+                    "1440p30=${v.areSizeAndRateSupported(2560, 1440, 30.0)} " +
+                    "bitrate=${v.bitrateRange}"
+        }
+        val avcInfo = android.media.MediaCodecList(android.media.MediaCodecList.REGULAR_CODECS)
+            .codecInfos.firstOrNull { it.isEncoder && it.name == "c2.qti.avc.encoder" }
+            ?.getCapabilitiesForType("video/avc")?.videoCapabilities
+            ?.let { "1080p60=${it.areSizeAndRateSupported(1920, 1080, 60.0)}" }
+
         return buildString {
             appendLine("camera $id extras")
+            appendLine("  min frame durations: ${durations.joinToString(" | ")}")
+            appendLine("  hevc encoder: $hevcInfo")
+            appendLine("  avc encoder: $avcInfo")
             appendLine("  highSpeed: $highSpeed")
             appendLine("  faceDetect modes: $faceModes  maxFaces=${c.get(CameraCharacteristics.STATISTICS_INFO_MAX_FACE_COUNT)}")
             appendLine("  OIS data modes: $oisModes")
@@ -120,14 +143,19 @@ object Cameras {
         }
     }
 
+    /** A resolution together with the frame rates reachable at it. */
+    data class Mode(val size: Size, val fps: List<Int>)
+
     data class Info(
         val id: String,
         val facing: Int,
-        val sizes: List<Size>,
+        val modes: List<Mode>,
         val focal: Float,
         val listed: Boolean,
         val label: String
-    )
+    ) {
+        val sizes: List<Size> get() = modes.map { it.size }
+    }
 
     /**
      * Sensors usable for video capture.
@@ -153,7 +181,7 @@ object Cameras {
             // back first, main sensor first, then by resolution: the 2 MP macro last
             .sortedWith(compareBy({ if (it.facing == CameraCharacteristics.LENS_FACING_BACK) 0 else 1 },
                 { !it.listed },
-                { -it.sizes.first().let { s -> s.width.toLong() * s.height } }))
+                { -it.modes.first().size.let { s -> s.width.toLong() * s.height } }))
             .map { it.copy(label = label(it, mainFocal)) }
     }
 
@@ -165,27 +193,74 @@ object Cameras {
             ?.sortedByDescending { it.width.toLong() * it.height }
             ?: return null
         if (sizes.isEmpty()) return null
+
+        // Rates a normal session can hold, capped by the sensor's minimum frame duration.
+        val regular = c.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES)
+            ?.filter { it.lower == it.upper }?.map { it.upper }?.distinct()?.sorted().orEmpty()
+        val highSpeedSizes = runCatching { map.highSpeedVideoSizes.toSet() }.getOrDefault(emptySet())
+
+        val modes = sizes.map { size ->
+            val maxRegular = runCatching { map.getOutputMinFrameDuration(MediaCodec::class.java, size) }
+                .getOrNull()?.takeIf { it > 0 }?.let { (1_000_000_000L / it).toInt() } ?: 30
+            val rates = regular.filter { it <= maxRegular }.toMutableList()
+
+            // 120/240 exist only through a constrained high-speed session, and only for the
+            // sizes the map lists for it - and only if an encoder can keep up.
+            if (size in highSpeedSizes) {
+                runCatching { map.getHighSpeedVideoFpsRangesFor(size) }.getOrNull()
+                    ?.filter { it.lower == it.upper }
+                    ?.map { it.upper }
+                    ?.filter { it > maxRegular && encoderHandles(size, it) }
+                    ?.forEach { if (it !in rates) rates.add(it) }
+            }
+            Mode(size, rates.sorted().ifEmpty { listOf(30) })
+        }
+
         return Info(
             id = id,
             facing = c.get(CameraCharacteristics.LENS_FACING) ?: -1,
-            sizes = sizes,
+            modes = modes,
             focal = c.get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)?.firstOrNull() ?: 0f,
             listed = listed,
             label = ""
         )
     }
 
+    /** True if either hardware encoder can take this size at this rate. */
+    private fun encoderHandles(size: Size, fps: Int): Boolean {
+        val codecs = android.media.MediaCodecList(android.media.MediaCodecList.REGULAR_CODECS).codecInfos
+        return listOf("video/avc", "video/hevc").any { mime ->
+            codecs.filter { it.isEncoder && it.supportedTypes.contains(mime) }.any { info ->
+                runCatching {
+                    info.getCapabilitiesForType(mime).videoCapabilities
+                        ?.areSizeAndRateSupported(size.width, size.height, fps.toDouble()) == true
+                }.getOrDefault(false)
+            }
+        }
+    }
+
+    /** English on purpose: these labels are shown in the Windows tray menu. */
     private fun label(info: Info, mainFocal: Float): String {
-        val side = if (info.facing == CameraCharacteristics.LENS_FACING_FRONT) "Фронт" else "Тыл"
-        val megapixels = info.sizes.first().let { it.width.toLong() * it.height / 1_000_000.0 }
+        val side = if (info.facing == CameraCharacteristics.LENS_FACING_FRONT) "Front" else "Back"
+        val megapixels = info.modes.first().size.let { it.width.toLong() * it.height / 1_000_000.0 }
         val lens = when {
             info.facing == CameraCharacteristics.LENS_FACING_FRONT -> ""
             mainFocal <= 0f || info.focal <= 0f -> ""
-            info.focal >= mainFocal -> if (info.focal > mainFocal * 1.5f) " теле" else " основной"
-            megapixels < 3.0 -> " макро"
-            else -> " ширик"
+            info.focal >= mainFocal -> if (info.focal > mainFocal * 1.5f) " tele" else " main"
+            megapixels < 3.0 -> " macro"
+            else -> " ultra-wide"
         }
-        return "$side$lens ${"%.1f".format(info.focal)}мм (${info.id})"
+        return "$side$lens ${"%.1f".format(java.util.Locale.US, info.focal)}mm (${info.id})"
+    }
+
+    /** Fixed frame rates the sensor advertises, e.g. 12, 15, 24, 30. */
+    fun fpsOptions(context: Context, id: String): List<Int> {
+        val manager = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
+        val c = runCatching { manager.getCameraCharacteristics(id) }.getOrNull() ?: return listOf(30)
+        val ranges = c.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES)
+            ?: return listOf(30)
+        return ranges.filter { it.lower == it.upper }.map { it.upper }.distinct().sorted()
+            .ifEmpty { listOf(30) }
     }
 
     /** 16:9 (+/- rounding). Webcam consumers expect widescreen. */

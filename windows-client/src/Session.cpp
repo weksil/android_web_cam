@@ -186,6 +186,7 @@ bool Session::connect(const std::string& ip, int timeoutMs) {
         params_.bitrate = get32(buf + 10);
         params_.ssrc = get32(buf + 14);
         params_.rtpSourcePort = get16(buf + 18);
+        params_.hevc = n >= 21 && buf[20] != 0;
 
         phoneRtp_ = phone_;
         phoneRtp_.sin_port = htons(params_.rtpSourcePort);
@@ -234,6 +235,25 @@ void Session::setExposure(int64_t exposureNs, int32_t iso) {
     len += 8;
     put32(msg + len, uint32_t(iso));
     sendControl(msg, len + 4);
+}
+
+void Session::setConfig(const std::string& cameraId, uint16_t width, uint16_t height, uint8_t fps,
+                        uint32_t bitrate, bool hevc) {
+    uint8_t msg[64];
+    int len = header(msg, kSetConfig);
+    const uint8_t idLength = uint8_t((std::min)(cameraId.size(), size_t(16)));
+    msg[len++] = idLength;
+    std::memcpy(msg + len, cameraId.data(), idLength);
+    len += idLength;
+    put16(msg + len, width);
+    len += 2;
+    put16(msg + len, height);
+    len += 2;
+    msg[len++] = fps;
+    put32(msg + len, bitrate);
+    len += 4;
+    msg[len++] = hevc ? 1 : 0;
+    sendControl(msg, len);
 }
 
 void Session::streamStop() {
@@ -292,7 +312,9 @@ bool Session::poll(int timeoutMs, const std::function<void(const uint8_t*, int)>
         if (FD_ISSET(rtp_, &rd)) {
             uint8_t buf[2048];
             sockaddr_in from{};
-            for (int i = 0; i < 256; ++i) {           // drain the socket
+            // At 120 fps the packet rate is four times higher than the 30 fps case, so the
+            // drain limit has to be generous or the socket buffer overflows between polls.
+            for (int i = 0; i < 4096; ++i) {
                 int fromLen = sizeof(from);
                 int n = recvfrom(rtp_, (char*)buf, sizeof(buf), 0, (sockaddr*)&from, &fromLen);
                 if (n <= 0) break;

@@ -22,7 +22,8 @@ public:
 
     ~H264Decoder();
 
-    bool init(uint32_t width, uint32_t height, uint32_t fps, std::string* err);
+    /** [hevc] selects the HEVC decoder instead of H.264. */
+    bool init(uint32_t width, uint32_t height, uint32_t fps, bool hevc, std::string* err);
     void shutdown();
 
     /** Feeds one Annex-B access unit. [ptsHns] is in 100-ns units. */
@@ -41,6 +42,7 @@ private:
     bool createDevice(std::string* err);
     bool createTransform(std::string* err);
     bool configureTypes(uint32_t width, uint32_t height, uint32_t fps, std::string* err);
+    GUID inputSubtype() const;
     bool selectOutputType(std::string* err);
     void pullOutput(const OnFrame& onFrame);
     void copyPlanes(const uint8_t* src, uint32_t pitch, uint32_t allocatedHeight, uint8_t* dst) const;
@@ -59,6 +61,7 @@ private:
     bool providesSamples_ = false;
     bool started_ = false;
     bool mfStarted_ = false;
+    bool hevc_ = false;
     std::string name_;
 };
 

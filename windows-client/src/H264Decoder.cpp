@@ -31,7 +31,12 @@ void fail(std::string* err, const char* what, HRESULT hr) {
 
 H264Decoder::~H264Decoder() { shutdown(); }
 
-bool H264Decoder::init(uint32_t width, uint32_t height, uint32_t fps, std::string* err) {
+GUID H264Decoder::inputSubtype() const {
+    return hevc_ ? MFVideoFormat_HEVC : MFVideoFormat_H264;
+}
+
+bool H264Decoder::init(uint32_t width, uint32_t height, uint32_t fps, bool hevc, std::string* err) {
+    hevc_ = hevc;
     HRESULT hr = MFStartup(MF_VERSION, MFSTARTUP_LITE);
     if (FAILED(hr)) { fail(err, "MFStartup", hr); return false; }
     mfStarted_ = true;
@@ -81,7 +86,7 @@ bool H264Decoder::createDevice(std::string* err) {
 }
 
 bool H264Decoder::createTransform(std::string* err) {
-    MFT_REGISTER_TYPE_INFO input{MFMediaType_Video, MFVideoFormat_H264};
+    MFT_REGISTER_TYPE_INFO input{MFMediaType_Video, inputSubtype()};
     IMFActivate** activates = nullptr;
     UINT32 count = 0;
 
@@ -131,7 +136,7 @@ bool H264Decoder::configureTypes(uint32_t width, uint32_t height, uint32_t fps, 
     if (FAILED(hr)) { fail(err, "MFCreateMediaType", hr); return false; }
 
     in->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
-    in->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_H264);
+    in->SetGUID(MF_MT_SUBTYPE, inputSubtype());
     in->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
     MFSetAttributeSize(in.Get(), MF_MT_FRAME_SIZE, width, height);
     MFSetAttributeRatio(in.Get(), MF_MT_FRAME_RATE, fps, 1);

@@ -43,7 +43,9 @@ class CameraStreamer(
     private val onError: (String) -> Unit,
     private val onAuto: (String) -> Unit = {},
     /** false when the PC stabilizes from gyro data: on-device EIS would fight it. */
-    private val stabilizeOnDevice: Boolean = true
+    private val stabilizeOnDevice: Boolean = true,
+    /** HEVC gives the same quality at roughly half the bitrate of H.264. */
+    private val useHevc: Boolean = false
 ) {
     private val rtpSink = sink as? RtpSink
     private val manager = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
@@ -119,12 +121,28 @@ class CameraStreamer(
         manualIso = iso
         val session = this.session ?: return
         val camera = this.device ?: return
-        runCatching { session.setRepeatingRequest(buildRequest(camera), autoWatcher, handler) }
+        runCatching { startRepeating(session, camera) }
             .onFailure { Log.w(TAG, "exposure update: $it") }
     }
 
     @Volatile private var manualExposureNs = 0L
     @Volatile private var manualIso = 0
+
+    /**
+     * Drops or restores the preview target without touching the session: while the phone
+     * screen is blank there is no point producing preview buffers or compositing them.
+     */
+    fun setPreviewEnabled(enabled: Boolean) {
+        if (enabled == previewEnabled) return
+        previewEnabled = enabled
+        Log.i(TAG, "preview stream ${if (enabled) "on" else "off"}")
+        val session = this.session ?: return
+        val camera = this.device ?: return
+        runCatching { startRepeating(session, camera) }
+            .onFailure { Log.w(TAG, "preview toggle: $it") }
+    }
+
+    @Volatile private var previewEnabled = true
 
     /** Runtime bitrate change for network adaptation. */
     fun setBitrate(bps: Int) {
@@ -139,22 +157,30 @@ class CameraStreamer(
     // ---- encoder ----
 
     private fun startEncoder() {
-        val format = MediaFormat.createVideoFormat(MIME, size.width, size.height).apply {
+        val mime = if (useHevc) MediaFormat.MIMETYPE_VIDEO_HEVC else MediaFormat.MIMETYPE_VIDEO_AVC
+        val format = MediaFormat.createVideoFormat(mime, size.width, size.height).apply {
             setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
             setInteger(MediaFormat.KEY_BIT_RATE, currentBitrate)
             setInteger(MediaFormat.KEY_FRAME_RATE, fps)
             setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
             setInteger(MediaFormat.KEY_BITRATE_MODE, MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR)
-            setInteger(MediaFormat.KEY_PROFILE, MediaCodecInfo.CodecProfileLevel.AVCProfileHigh)
-            // 4.1 tops out around 1080p30; 4K needs 5.2.
-            setInteger(MediaFormat.KEY_LEVEL,
-                if (size.width > 1920) MediaCodecInfo.CodecProfileLevel.AVCLevel52
-                else MediaCodecInfo.CodecProfileLevel.AVCLevel41)
+            if (useHevc) {
+                setInteger(MediaFormat.KEY_PROFILE, MediaCodecInfo.CodecProfileLevel.HEVCProfileMain)
+                setInteger(MediaFormat.KEY_LEVEL,
+                    if (size.width > 2560) MediaCodecInfo.CodecProfileLevel.HEVCMainTierLevel51
+                    else MediaCodecInfo.CodecProfileLevel.HEVCMainTierLevel41)
+            } else {
+                setInteger(MediaFormat.KEY_PROFILE, MediaCodecInfo.CodecProfileLevel.AVCProfileHigh)
+                // 4.1 tops out around 1080p30; 4K needs 5.2.
+                setInteger(MediaFormat.KEY_LEVEL,
+                    if (size.width > 1920) MediaCodecInfo.CodecProfileLevel.AVCLevel52
+                    else MediaCodecInfo.CodecProfileLevel.AVCLevel41)
+            }
             setInteger(MediaFormat.KEY_PRIORITY, 0)          // 0 = realtime
             setInteger(MediaFormat.KEY_LATENCY, 1)           // 1 frame of encoder latency
             setFloat(MediaFormat.KEY_MAX_FPS_TO_ENCODER, fps.toFloat())
         }
-        val codec = MediaCodec.createEncoderByType(MIME)
+        val codec = MediaCodec.createEncoderByType(mime)
         codec.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
         inputSurface = codec.createInputSurface()
         codec.start()
@@ -214,24 +240,46 @@ class CameraStreamer(
         }
     }
 
+    /** Above 30 fps the sensor only runs in a constrained high-speed session. */
+    private val highSpeed get() = fps > 30
+
     private fun configureSession(camera: CameraDevice) {
         val encoderSurface = inputSurface ?: return
         val outputs = buildList {
-            add(OutputConfiguration(encoderSurface).also { applyVideoCallUseCase(it) })
-            previewSurface?.let { add(OutputConfiguration(it)) }
+            add(OutputConfiguration(encoderSurface).also { if (!highSpeed) applyVideoCallUseCase(it) })
+            // A high-speed session drives the encoder alone: with a preview attached this
+            // HAL splits the batch between the two outputs and the encoder gets an empty
+            // buffer for every second frame, which arrives as a black frame.
+            if (!highSpeed) previewSurface?.let { add(OutputConfiguration(it)) }
         }
-        val config = SessionConfiguration(SessionConfiguration.SESSION_REGULAR, outputs, executor,
+        val type = if (highSpeed) SessionConfiguration.SESSION_HIGH_SPEED
+                   else SessionConfiguration.SESSION_REGULAR
+        val config = SessionConfiguration(type, outputs, executor,
             object : CameraCaptureSession.StateCallback() {
                 override fun onConfigured(s: CameraCaptureSession) {
                     session = s
                     if (!running) return
-                    runCatching { s.setRepeatingRequest(buildRequest(camera), autoWatcher, handler) }
+                    runCatching { startRepeating(s, camera) }
                         .onFailure { fail("repeating request: $it") }
                 }
 
                 override fun onConfigureFailed(s: CameraCaptureSession) = fail("session configure failed")
             })
         camera.createCaptureSession(config)
+    }
+
+    /**
+     * A high-speed session does not take a plain repeating request: the frames come out of
+     * the sensor in batches, so the request has to be expanded into a burst list.
+     */
+    private fun startRepeating(s: CameraCaptureSession, camera: CameraDevice) {
+        val request = buildRequest(camera)
+        if (highSpeed && s is android.hardware.camera2.CameraConstrainedHighSpeedCaptureSession) {
+            val burst = s.createHighSpeedRequestList(request)
+            s.setRepeatingBurst(burst, autoWatcher, handler)
+        } else {
+            s.setRepeatingRequest(request, autoWatcher, handler)
+        }
     }
 
     private fun applyVideoCallUseCase(oc: OutputConfiguration) {
@@ -250,7 +298,7 @@ class CameraStreamer(
     private fun buildRequest(camera: CameraDevice): CaptureRequest {
         val b = camera.createCaptureRequest(CameraDevice.TEMPLATE_RECORD)
         inputSurface?.let { b.addTarget(it) }
-        previewSurface?.let { b.addTarget(it) }
+        if (previewEnabled && !highSpeed) previewSurface?.let { b.addTarget(it) }
 
         // 3A: everything auto and explicitly unlocked, so the HAL keeps re-converging
         // while the light changes. Every mode is checked against what this sensor
@@ -258,7 +306,9 @@ class CameraStreamer(
         b.set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_AUTO)
         b.set(CaptureRequest.CONTROL_SCENE_MODE, CameraMetadata.CONTROL_SCENE_MODE_DISABLED)
 
-        val manual = manualExposureNs > 0 && manualIso > 0
+        // A high-speed session refuses manual sensor control and most 3A tuning; it also
+        // does not need the exposure controller, since 1/fps is already short.
+        val manual = !highSpeed && manualExposureNs > 0 && manualIso > 0
         if (manual) {
             b.set(CaptureRequest.CONTROL_AE_MODE, CameraMetadata.CONTROL_AE_MODE_OFF)
             b.set(CaptureRequest.SENSOR_EXPOSURE_TIME, manualExposureNs)
@@ -285,6 +335,15 @@ class CameraStreamer(
         }
 
         pickAfMode()?.let { b.set(CaptureRequest.CONTROL_AF_MODE, it) }
+
+        if (highSpeed) {
+            // Everything below is either rejected or ignored in a high-speed session.
+            b.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, Range(fps, fps))
+            b.set(CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE,
+                CameraMetadata.CONTROL_VIDEO_STABILIZATION_MODE_OFF)
+            Log.i(TAG, "high-speed session at $fps fps")
+            return b.build()
+        }
 
         // Meter over the whole frame instead of whatever region the HAL defaults to.
         fullFrameRegion()?.let { region ->
